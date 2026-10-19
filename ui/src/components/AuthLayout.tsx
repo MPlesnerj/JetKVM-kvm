@@ -7,7 +7,7 @@ import Container from "@components/Container";
 import Fieldset from "@components/Fieldset";
 import GridBackground from "@components/GridBackground";
 import StepCounter from "@components/StepCounter";
-import { CLOUD_API } from "@/ui.config";
+import { CLOUD_API, CLOUD_LOGIN_PROVIDER } from "@/ui.config";
 
 interface AuthLayoutProps {
   title: string;
@@ -70,7 +70,7 @@ export default function AuthLayout({
                       theme="light"
                       fullWidth
                       text={`${action}`}
-                      LeadingIcon={GoogleIcon}
+                      LeadingIcon={CLOUD_LOGIN_PROVIDER === "microsoft" ? undefined : GoogleIcon}
                       textAlign="center"
                       type="submit"
                       loading={
