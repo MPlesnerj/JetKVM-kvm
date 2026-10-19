@@ -94,6 +94,12 @@ type Config struct {
 	CloudToken           string               `json:"cloud_token"`
 	TailscaleControlURL  string               `json:"tailscale_control_url,omitempty"`
 	GoogleIdentity       string               `json:"google_identity"`
+	// Identity provider of the cloud this device is adopted to. Empty means Google (upstream).
+	CloudOIDCIssuer      string               `json:"cloud_oidc_issuer,omitempty"`
+	// Entra ID tenant: when set, every user of that tenant whose token was issued for the
+	// cloud's app may open sessions (the cloud decides who sees which device), not only the
+	// user who adopted the device.
+	CloudOIDCTenant      string               `json:"cloud_oidc_tenant,omitempty"`
 	JigglerEnabled       bool                 `json:"jiggler_enabled"`
 	JigglerConfig        *JigglerConfig       `json:"jiggler_config"`
 	AutoUpdateEnabled    bool                 `json:"auto_update_enabled"`

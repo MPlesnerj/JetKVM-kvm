@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jetkvm/kvm/internal/sync"
@@ -201,6 +202,43 @@ func wsResetMetrics(established bool, sourceType string, source string) {
 	}
 }
 
+const googleOIDCIssuer = "https://accounts.google.com"
+
+// cloudOIDCConfig asks the cloud which OpenID Connect provider it signs users in with
+// (GET <cloud>/oidc/config). The JetKVM cloud has no such endpoint, so any error or an
+// empty answer means Google, exactly as before. The trust anchor is the cloud URL the
+// device owner configured on the device, which the device already trusts for adoption.
+func cloudOIDCConfig(ctx context.Context, cloudURL string) (issuer string, clientID string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cloudURL, "/")+"/oidc/config", nil)
+	if err != nil {
+		return googleOIDCIssuer, ""
+	}
+	resp, err := (&http.Client{Timeout: CloudAPIRequestTimeout}).Do(req)
+	if err != nil {
+		return googleOIDCIssuer, ""
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusOK {
+		return googleOIDCIssuer, ""
+	}
+	var cfg struct {
+		Issuer   string `json:"issuer"`
+		ClientID string `json:"clientId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil || !strings.HasPrefix(cfg.Issuer, "https://") {
+		return googleOIDCIssuer, ""
+	}
+	return cfg.Issuer, cfg.ClientID
+}
+
+// configuredOIDCIssuer is the provider stored at adoption time (Google when unset).
+func configuredOIDCIssuer() string {
+	if config.CloudOIDCIssuer != "" {
+		return config.CloudOIDCIssuer
+	}
+	return googleOIDCIssuer
+}
+
 func handleCloudRegister(c *gin.Context) {
 	var req CloudRegisterRequest
 
@@ -257,26 +295,46 @@ func handleCloudRegister(c *gin.Context) {
 
 	config.CloudToken = tokenResp.SecretToken
 
-	provider, err := oidc.NewProvider(c, "https://accounts.google.com")
+	// Google for the JetKVM cloud; e.g. Microsoft Entra ID for a self-hosted cloud that says so.
+	issuer, cloudClientID := cloudOIDCConfig(c, config.CloudURL)
+	clientID := req.ClientId
+	if cloudClientID != "" && clientID != cloudClientID {
+		cloudLogger.Warn().Str("issuer", issuer).Msg("client ID from the browser does not match the cloud's OIDC config")
+		c.JSON(400, gin.H{"error": "Invalid OIDC client"})
+		return
+	}
+
+	provider, err := oidc.NewProvider(c, issuer)
 	if err != nil {
-		cloudLogger.Error().Err(err).Msg("failed to initialize OIDC provider")
+		cloudLogger.Error().Err(err).Str("issuer", issuer).Msg("failed to initialize OIDC provider")
 		c.JSON(500, gin.H{"error": "Failed to initialize OIDC provider"})
 		return
 	}
 
 	oidcConfig := &oidc.Config{
-		ClientID: req.ClientId,
+		ClientID: clientID,
 	}
 
 	verifier := provider.Verifier(oidcConfig)
 	idToken, err := verifier.Verify(c, req.OidcGoogle)
 	if err != nil {
-		cloudLogger.Warn().Err(err).Msg("OIDC token verification failed")
+		cloudLogger.Warn().Err(err).Str("issuer", issuer).Msg("OIDC token verification failed")
 		c.JSON(400, gin.H{"error": "Invalid OIDC token"})
 		return
 	}
 
 	config.GoogleIdentity = idToken.Audience[0] + ":" + idToken.Subject
+	config.CloudOIDCIssuer = ""
+	config.CloudOIDCTenant = ""
+	if issuer != googleOIDCIssuer {
+		var claims struct {
+			Tid string `json:"tid"`
+		}
+		_ = idToken.Claims(&claims)
+		config.CloudOIDCIssuer = issuer
+		config.CloudOIDCTenant = claims.Tid
+		cloudLogger.Info().Str("issuer", issuer).Str("tenant", claims.Tid).Msg("adopted to a cloud with its own identity provider")
+	}
 
 	// Save the updated configuration
 	if err := SaveConfig(); err != nil {
@@ -400,7 +458,7 @@ func runWebsocketClient() error {
 func authenticateSession(ctx context.Context, c *websocket.Conn, req WebRTCSessionRequest) error {
 	oidcCtx, cancelOIDC := context.WithTimeout(ctx, CloudOidcRequestTimeout)
 	defer cancelOIDC()
-	provider, err := oidc.NewProvider(oidcCtx, "https://accounts.google.com")
+	provider, err := oidc.NewProvider(oidcCtx, configuredOIDCIssuer())
 	if err != nil {
 		_ = wsjson.Write(context.Background(), c, gin.H{
 			"error": fmt.Sprintf("failed to initialize OIDC provider: %v", err),
@@ -420,12 +478,25 @@ func authenticateSession(ctx context.Context, c *websocket.Conn, req WebRTCSessi
 	}
 
 	googleIdentity := idToken.Audience[0] + ":" + idToken.Subject
-	if config.GoogleIdentity != googleIdentity {
-		_ = wsjson.Write(context.Background(), c, gin.H{"error": "google identity mismatch"})
-		return fmt.Errorf("google identity mismatch")
+	if config.GoogleIdentity == googleIdentity {
+		return nil // the user who adopted the device (upstream behaviour)
 	}
 
-	return nil
+	// Entra ID tenant mode: any user of the adopting tenant, signed in to the same app,
+	// may open a session. The cloud only forwards sessions for devices the user may see.
+	if config.CloudOIDCTenant != "" {
+		adoptedAudience, _, _ := strings.Cut(config.GoogleIdentity, ":")
+		var claims struct {
+			Tid string `json:"tid"`
+		}
+		if err := idToken.Claims(&claims); err == nil &&
+			claims.Tid == config.CloudOIDCTenant && idToken.Audience[0] == adoptedAudience {
+			return nil
+		}
+	}
+
+	_ = wsjson.Write(context.Background(), c, gin.H{"error": "google identity mismatch"})
+	return fmt.Errorf("google identity mismatch")
 }
 
 func handleSessionRequest(
@@ -567,6 +638,8 @@ func rpcDeregisterDevice() error {
 	if resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
 		config.CloudToken = ""
 		config.GoogleIdentity = ""
+		config.CloudOIDCIssuer = ""
+		config.CloudOIDCTenant = ""
 
 		if err := SaveConfig(); err != nil {
 			return fmt.Errorf("failed to save configuration after deregistering: %w", err)
