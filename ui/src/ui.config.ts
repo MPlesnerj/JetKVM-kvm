@@ -4,6 +4,9 @@ const toBoolean = (value: string | undefined) => {
 };
 export const CLOUD_API = import.meta.env.VITE_CLOUD_API;
 
+// "microsoft" for a cloud that signs in with Entra ID (hides the Google logo on the login button)
+export const CLOUD_LOGIN_PROVIDER = (import.meta.env.VITE_CLOUD_LOGIN_PROVIDER || "google").toLowerCase();
+
 export const CLOUD_BACKWARDS_COMPATIBLE_VERSION =
   import.meta.env.VITE_CLOUD_BACKWARDS_COMPATIBLE_VERSION || "0.5.0";
 
