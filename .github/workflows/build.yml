@@ -38,6 +38,14 @@ jobs:
         run: make frontend
       - name: Build application
         run: ./scripts/ci_helper.sh make build_dev
+      # Firmware binary for installing on a device (Actions tab -> this run -> Artifacts)
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetkvm_app-${{ github.sha }}
+          path: bin/jetkvm_app
+          retention-days: 30
+          if-no-files-found: error
       - name: Run tests
         run: go test ./... -json > testreport.json
       - uses: becheran/go-testreport@v0.3.2
